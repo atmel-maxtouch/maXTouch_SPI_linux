@@ -1255,6 +1255,149 @@ static int atmel_spi_setup(struct spi_device *spi)
 	return 0;
 }
 
+/**
+ * spi_set_cs_timing - configure CS setup, hold, and inactive delays
+ * @spi: the device that requires specific CS timing configuration
+ * @setup: CS setup time specified via @spi_delay
+ * @hold: CS hold time specified via @spi_delay
+ * @inactive: CS inactive delay between transfers specified via @spi_delay
+ *
+ * Return: zero on success, else a negative error code.
+ */
+
+/*
+int spi_set_cs_timing(struct spi_device *spi, struct spi_delay *setup,
+		      struct spi_delay *hold, struct spi_delay *inactive)
+{
+	size_t len;
+
+	if (spi->controller->set_cs_timing)
+		return spi->controller->set_cs_timing(spi, setup, hold,
+						      inactive);
+
+	if ((setup && setup->unit == SPI_DELAY_UNIT_SCK) ||
+	    (hold && hold->unit == SPI_DELAY_UNIT_SCK) ||
+	    (inactive && inactive->unit == SPI_DELAY_UNIT_SCK)) {
+		dev_err(&spi->dev,
+			"Clock-cycle delays for CS not supported in SW mode\n");
+		return -ENOTSUPP;
+	}
+
+	len = sizeof(struct spi_delay);
+
+	if (setup)
+		memcpy(&spi->controller->cs_setup, setup, len);
+	else
+		memset(&spi->controller->cs_setup, 0, len);
+
+	if (hold)
+		memcpy(&spi->controller->cs_hold, hold, len);
+	else
+		memset(&spi->controller->cs_hold, 0, len);
+
+	if (inactive)
+		memcpy(&spi->controller->cs_inactive, inactive, len);
+	else
+		memset(&spi->controller->cs_inactive, 0, len);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(spi_set_cs_timing);
+
+*/
+
+int spi_delay_to_ns(struct spi_delay *_delay, struct spi_transfer *xfer)
+{
+	u32 delay = _delay->value;
+	u32 unit = _delay->unit;
+	u32 hz;
+
+	if (!delay)
+		return 0;
+
+	switch (unit) {
+	case SPI_DELAY_UNIT_USECS:
+		delay *= 1000;
+		break;
+	case SPI_DELAY_UNIT_NSECS: /* nothing to do here */
+		break;
+	case SPI_DELAY_UNIT_SCK:
+		/* clock cycles need to be obtained from spi_transfer */
+		if (!xfer)
+			return -EINVAL;
+		/* if there is no effective speed know, then approximate
+		 * by underestimating with half the requested hz
+		 */
+		hz = xfer->effective_speed_hz ?: xfer->speed_hz / 2;
+		if (!hz)
+			return -EINVAL;
+		delay *= DIV_ROUND_UP(1000000000, hz);
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return delay;
+}
+EXPORT_SYMBOL_GPL(spi_delay_to_ns);
+
+static void _spi_transfer_delay_ns(u32 ns)
+{
+	if (!ns)
+		return;
+	if (ns <= 1000) {
+		ndelay(ns);
+	} else {
+		u32 us = DIV_ROUND_UP(ns, 1000);
+
+		if (us <= 10)
+			udelay(us);
+		else
+			usleep_range(us, us + DIV_ROUND_UP(us, 10));
+	}
+}
+
+int spi_delay_exec(struct spi_delay *_delay, struct spi_transfer *xfer)
+{
+	int delay;
+
+	might_sleep();
+
+	if (!_delay)
+		return -EINVAL;
+
+	delay = spi_delay_to_ns(_delay, xfer);
+	if (delay < 0)
+		return delay;
+
+	_spi_transfer_delay_ns(delay);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(spi_delay_exec);
+
+static void _spi_transfer_cs_change_delay(struct spi_message *msg, struct spi_transfer *xfer)
+{
+	u32 delay = xfer->cs_change_delay.value;
+	u8 unit = xfer->cs_change_delay.unit;
+	int ret;
+
+	/* return early on "fast" mode - for everytning but USECS */
+	if (!delay) {
+		if (unit == SPI_DELAY_UNIT_USECS)
+				_spi_transfer_delay_ns(10000);
+			return;
+	}
+
+	ret = spi_delay_exec(&xfer->cs_change_delay, xfer);
+	if (ret) {
+		dev_err_once(&msg->spi->dev,
+				"USE of unsupported delay unit %i, using default of 10us\n", 
+				unit);
+		_spi_transfer_delay_ns(10000);
+	}
+}
+
 static int atmel_spi_one_transfer(struct spi_master *master,
 					struct spi_message *msg,
 					struct spi_transfer *xfer)
@@ -1385,10 +1528,10 @@ static int atmel_spi_one_transfer(struct spi_master *master,
 	if (xfer->cs_change) {
 		if (list_is_last(&xfer->transfer_list,
 				 &msg->transfers)) {
-			as->keep_cs = true;
+			as->keep_cs = false;
 		} else {
 			cs_deactivate(as, msg->spi);
-			udelay(10);
+			_spi_transfer_cs_change_delay(msg, xfer);
 			cs_activate(as, msg->spi);
 		}
 	}
@@ -1439,8 +1582,10 @@ static int atmel_spi_transfer_one_message(struct spi_master *master,
 	}
 
 msg_done:
-	if (!as->keep_cs)
+	if (!as->keep_cs) {
 		cs_deactivate(as, msg->spi);
+		_spi_transfer_cs_change_delay(msg, xfer);
+	}
 
 	atmel_spi_unlock(as);
 
