@@ -3404,7 +3404,9 @@ static ssize_t mxt_object_show(struct device *dev,
 			u16 size = mxt_obj_size(object);
 			u16 addr = object->start_address + j * size;
 
+			data->irq_state = MXT_IRQ_READ_REQ;
 			error = mxt_read_block (data, addr, size, obuf);
+			data->irq_state = MXT_IRQ_READ_DONE;
 
 			if (error)
 				goto done;
