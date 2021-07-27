@@ -1121,8 +1121,8 @@ static void _spi_transfer_delay_ns(u32 ns)
 static void _spi_transfer_cs_change_delay(struct spi_message *msg,
 					  struct spi_transfer *xfer)
 {
-	u32 delay = xfer->cs_change_delay;
-	u32 unit = xfer->cs_change_delay_unit;
+	u32 delay = xfer->cs_change_delay.value;
+	u8 unit = xfer->cs_change_delay.unit;
 	u32 hz;
 
 	/* return early on "fast" mode - for everything but USECS */

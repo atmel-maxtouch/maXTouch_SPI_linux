@@ -90,6 +90,22 @@ void spi_statistics_add_transfer_stats(struct spi_statistics *stats,
 	SPI_STATISTICS_ADD_TO_FIELD(stats, field, 1)
 
 /**
+ * struct spi_delay - SPI delay information
+ * @value: Value for the delay
+ * @unit: Unit for the delay
+ */
+struct spi_delay {
+#define SPI_DELAY_UNIT_USECS	0
+#define SPI_DELAY_UNIT_NSECS	1
+#define SPI_DELAY_UNIT_SCK		2
+	u32	value;
+	u8	unit;
+};
+
+extern int spi_delay_to_ns(struct spi_delay *_delay, struct spi_transfer *xfer);
+extern int spi_delay_exec(struct spi_delay *_delay, struct spi_transfer *xfer);
+
+/**
  * struct spi_device - Controller side proxy for an SPI slave device
  * @dev: Driver model representation of the device.
  * @controller: SPI controller used with the device.
@@ -851,7 +867,7 @@ struct spi_transfer {
 	u8		bits_per_word;
 	u8		word_delay_usecs;
 	u16		delay_usecs;
-	u16		cs_change_delay;
+	struct spi_delay 	cs_change_delay;
 	u8		cs_change_delay_unit;
 #define SPI_DELAY_UNIT_USECS	0
 #define SPI_DELAY_UNIT_NSECS	1
