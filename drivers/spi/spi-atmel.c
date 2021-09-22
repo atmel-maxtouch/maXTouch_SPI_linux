@@ -1249,9 +1249,13 @@ static int atmel_spi_setup(struct spi_device *spi)
 		"setup: bpw %u mode 0x%x -> csr%d %08x\n",
 		bits, spi->mode, spi->chip_select, csr);
 
-	if (!atmel_spi_is_v2(as))
-		spi_writel(as, CSR0 + 4 * chip_select, csr);
+	/* Removed if statement, TBD, causes problems with SCK init state */
+	/* Setup no programming SPI mode correctly */
+	//if (!atmel_spi_is_v2(as)) {
+		//dev_info(&spi->dev,	"Did I get here\n");
 
+		spi_writel(as, CSR0 + 4 * chip_select, csr);
+//}
 	return 0;
 }
 
@@ -1625,6 +1629,7 @@ static void atmel_get_caps(struct atmel_spi *as)
 
 static void atmel_spi_init(struct atmel_spi *as)
 {
+
 	spi_writel(as, CR, SPI_BIT(SWRST));
 	spi_writel(as, CR, SPI_BIT(SWRST)); /* AT91SAM9263 Rev B workaround */
 
@@ -1641,6 +1646,7 @@ static void atmel_spi_init(struct atmel_spi *as)
 
 	if (as->use_pdc)
 		spi_writel(as, PTCR, SPI_BIT(RXTDIS) | SPI_BIT(TXTDIS));
+
 	spi_writel(as, CR, SPI_BIT(SPIEN));
 }
 
