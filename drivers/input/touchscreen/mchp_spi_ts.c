@@ -113,7 +113,7 @@
 #define MXT_FW_RESET_TIME	3000	/* msec */
 #define MXT_FW_CHG_TIMEOUT	300	/* msec */
 #define MXT_BOOTLOADER_WAIT	3000	/* msec */
-#define MXT_CS_MAX_DELAY 	50 	/* msec */
+#define MXT_CS_MAX_DELAY 	1 	/* msec */
 #define MXT_REPORTALL_MAX_DELAY	50 	/* msec */
 #define MXT_CONFIG_MAX_DELAY 	3 	/* msec */
 #define MXT_BOOTLOADER_READ 	0x01	/* msec */
@@ -372,10 +372,11 @@ static int mxt_wait_for_completion(struct mxt_data *data,
 	long ret;
 
 	ret = wait_for_completion_interruptible_timeout(comp, timeout);
+
 	if (ret < 0) {
 		return ret;
 	} else if (ret == 0) {
-		dev_err(dev, "Wait for completion timed out.\n");
+		dev_err(dev, "Wait for completion timed out [%d].\n", ret);
 		return -ETIMEDOUT;
 	} else {
 		dev_dbg(dev, "Time left: %u ms\n", jiffies_to_msecs(ret));
@@ -664,22 +665,21 @@ static int mxt_write_block (struct mxt_data *data, u16 reg, u16 len, const void 
 	if (!databuf)
 		return -ENOMEM;
 
+	if (data->crc_enabled)
+		block_size = MXT_MAX_SPI_BLOCK_CRC;
+
 	totalBytesToWrite = len;
 
 	do {
 
-		reinit_completion(&data->write_completion);
-
-
-		if (data->crc_enabled)
-			block_size = MXT_MAX_SPI_BLOCK_CRC; 
+		reinit_completion(&data->write_completion); 
 
  		if (totalBytesToWrite > block_size)
  			msg_length = block_size;
  		else 
  			msg_length = totalBytesToWrite;
 
-		ret = mxt_spi_write_req(data, (reg + data_ptr), msg_length, val);
+		ret = mxt_spi_write_req(data, (reg + data_ptr), msg_length, (val + data_ptr));
  
 		mxt_wait_for_completion(data, &data->write_completion,
 					      MXT_CS_MAX_DELAY);
@@ -742,6 +742,8 @@ static int mxt_spi_read_req(struct mxt_data *data, u16 reg, u16 len)
 	tr->xfer[0].len = (SPI_HEADER_SIZE);
 	//request->xfer[0].delay_usecs = 500;
 	tr->xfer[0].cs_change = 1;
+	tr->xfer[0].cs_change_delay.unit = 0;
+	tr->xfer[0].cs_change_delay.value = 500;
 
 	spi_message_add_tail(&tr->xfer[0], &tr->msg);
 
@@ -1398,7 +1400,7 @@ static int mxt_process_msg_req(struct mxt_data *data)
 static irqreturn_t mxt_spi_interrupt(int irq, void *dev_id)
 {
 	struct mxt_data *data = dev_id;
-	int error; 
+	int error;
 
 	if (data->in_bootloader) {
 		complete(&data->bl_completion);
@@ -1406,8 +1408,6 @@ static irqreturn_t mxt_spi_interrupt(int irq, void *dev_id)
 	}
 
 	complete(&data->t6_cmd_completion);
-	complete(&data->read_completion);
-	complete(&data->write_completion);
 
 	/* Required for SPI controller */
 	if (data->system_power_up == false){
@@ -1432,7 +1432,11 @@ static irqreturn_t mxt_spi_interrupt(int irq, void *dev_id)
 		break;
 
 		case MXT_IRQ_READ_REQ:
+			complete(&data->read_completion);
+		break;
+
 		case MXT_IRQ_WRITE_REQ:
+			complete(&data->write_completion);
 		break;
 
 		default:
@@ -2756,6 +2760,8 @@ static int mxt_clear_cfg(struct mxt_data *data)
 			msg_size, (config.mem + write_offset));
 
 		mxt_wait_for_completion(data, &data->write_completion, MXT_CS_MAX_DELAY);
+
+		data->irq_state = MXT_IRQ_WRITE_DONE;
 
 		error = mxt_spi_write_process(data);
 
