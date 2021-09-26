@@ -328,12 +328,6 @@ struct mxt_data {
 	/* for fw update in bootloader */
 	struct completion bl_completion;
 
-	/* for reset handling */
-	struct completion reset_completion;
-
-	/* for config update handling */
-	struct completion crc_completion;
-
 	struct completion t6_cmd_completion;
 	struct completion read_completion;
 	struct completion write_completion;
@@ -376,7 +370,7 @@ static int mxt_wait_for_completion(struct mxt_data *data,
 	if (ret < 0) {
 		return ret;
 	} else if (ret == 0) {
-		dev_err(dev, "Wait for completion timed out [%d].\n", ret);
+		dev_err(dev, "Wait for completion timed out\n");
 		return -ETIMEDOUT;
 	} else {
 		dev_dbg(dev, "Time left: %u ms\n", jiffies_to_msecs(ret));
@@ -1162,7 +1156,7 @@ static void mxt_proc_t6_messages(struct mxt_data *data, u8 *msg)
 		dev_dbg(&spi->dev, "T6 Config Checksum: 0x%06X\n", crc);
 	}
 
-	complete(&data->crc_completion);
+	complete(&data->t6_cmd_completion);
 
 	/* Output debug if status has changed */
 	dev_dbg(&spi->dev, "T6 Status 0x%02X%s%s%s%s%s%s%s\n",
@@ -1407,8 +1401,6 @@ static irqreturn_t mxt_spi_interrupt(int irq, void *dev_id)
 		return IRQ_HANDLED;
 	}
 
-	complete(&data->t6_cmd_completion);
-
 	/* Required for SPI controller */
 	if (data->system_power_up == false){
 		mxt_spi_read(data);
@@ -1418,6 +1410,19 @@ static irqreturn_t mxt_spi_interrupt(int irq, void *dev_id)
 
 	if (!data->object_table)
 		return IRQ_HANDLED;
+
+	switch (data->irq_state) {
+		case MXT_IRQ_READ_REQ:
+			complete(&data->read_completion);
+		break;
+
+		case MXT_IRQ_WRITE_REQ:
+			complete(&data->write_completion);
+		break;
+
+		default:
+		break;
+	}
 
 	if (data->irq_processing) {
 	switch (data->irq_state)
@@ -1429,14 +1434,6 @@ static irqreturn_t mxt_spi_interrupt(int irq, void *dev_id)
 
 		case MXT_IRQ_PROCESS_READ:
 			error = mxt_process_msg_req(data);
-		break;
-
-		case MXT_IRQ_READ_REQ:
-			complete(&data->read_completion);
-		break;
-
-		case MXT_IRQ_WRITE_REQ:
-			complete(&data->write_completion);
 		break;
 
 		default:
@@ -3661,9 +3658,6 @@ static int mxt_spi_probe(struct spi_device *spi)
 	spi_set_drvdata(spi, data);
 
 	init_completion(&data->bl_completion);
-	//init_completion(&data->reset_completion);
-
-	init_completion(&data->crc_completion);
 	init_completion(&data->read_completion);
 	init_completion(&data->write_completion);
 	init_completion(&data->t6_cmd_completion);
