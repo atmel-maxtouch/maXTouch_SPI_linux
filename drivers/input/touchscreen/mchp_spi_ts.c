@@ -47,10 +47,12 @@
 #define MXT_OBJECT_START	0x07
 #define MXT_OBJECT_SIZE		6
 #define MXT_INFO_CHECKSUM_SIZE	3
+#define MXT_MAX_SPI_BLOCK_CRC	14	/* Max size data byte minus crc8 */
 #define MXT_MAX_SPI_BLOCK	64
 #define USE_SPI_DMA		0
 #define SPI_HEADER_SIZE		0x06
 #define SPI_MAX_SIZE_LIMIT	MXT_MAX_SPI_BLOCK + SPI_HEADER_SIZE
+#define SPI_MAX_SIZE_LIMIT_CRC	MXT_MAX_SPI_BLOCK_CRC + SPI_HEADER_SIZE
 
 /* mXT SPI Definitions */
 #define MXT_SPI_WRITE_REQ	0x01
@@ -94,6 +96,7 @@
 #define MXT_SPT_TOUCHEVENTTRIGGER_T79		   79
 #define MXT_PROCI_RETRANSMISSIONCOMPENSATION_T80   80
 #define MXT_TOUCH_MULTITOUCHSCREEN_T100 	   100
+#define MXT_SPT_MESSAGECOUNT_T144		   144
 
 /* MXT_GEN_MESSAGE_T5 object */
 #define MXT_RPTID_NOMSG		0xff
@@ -110,7 +113,7 @@
 #define MXT_FW_RESET_TIME	3000	/* msec */
 #define MXT_FW_CHG_TIMEOUT	300	/* msec */
 #define MXT_BOOTLOADER_WAIT	3000	/* msec */
-#define MXT_CS_MAX_DELAY 	50 	/* msec */
+#define MXT_CS_MAX_DELAY 	1 	/* msec */
 #define MXT_REPORTALL_MAX_DELAY	50 	/* msec */
 #define MXT_CONFIG_MAX_DELAY 	3 	/* msec */
 #define MXT_BOOTLOADER_READ 	0x01	/* msec */
@@ -276,6 +279,7 @@ struct mxt_data {
 	u8 t100_aux_area;
 	u8 t100_aux_vect;
 	struct bin_attribute mem_access_attr;
+	bool crc_enabled;
 	bool debug_enabled;
 	bool debug_v2_enabled;
 	u8 *debug_msg_data;
@@ -313,6 +317,7 @@ struct mxt_data {
 	u16 T44_address;
 	u8 T100_reportid_min;
 	u8 T100_reportid_max;
+	u16 T144_address;
 
 	/* Cached instance parameter */
 	u8 T100_instances;
@@ -322,12 +327,6 @@ struct mxt_data {
 
 	/* for fw update in bootloader */
 	struct completion bl_completion;
-
-	/* for reset handling */
-	struct completion reset_completion;
-
-	/* for config update handling */
-	struct completion crc_completion;
 
 	struct completion t6_cmd_completion;
 	struct completion read_completion;
@@ -344,6 +343,7 @@ struct mxt_data {
 
 	bool irq_processing;
 	bool system_power_up;
+	bool mxt_reset_state;
 };
 
 /*
@@ -366,10 +366,11 @@ static int mxt_wait_for_completion(struct mxt_data *data,
 	long ret;
 
 	ret = wait_for_completion_interruptible_timeout(comp, timeout);
+
 	if (ret < 0) {
 		return ret;
 	} else if (ret == 0) {
-		dev_err(dev, "Wait for completion timed out.\n");
+		dev_err(dev, "Wait for completion timed out\n");
 		return -ETIMEDOUT;
 	} else {
 		dev_dbg(dev, "Time left: %u ms\n", jiffies_to_msecs(ret));
@@ -432,6 +433,8 @@ static int mxt_spi_read(struct mxt_data *data)
  *  registers. Ignores IRQ message on response.
  *  Send request and response message within
  *  same function.
+ *  Limit max packet length to 15 for crc 
+ *  enabled devices, inc 1 byte for termination
  *  
 */
 
@@ -443,7 +446,8 @@ static int mxt_spi_write_xfer(struct mxt_data *data, u16 reg, u16 len, void *val
 	u8 tx_buf[16];
 	u8 rx_buf[16];
 	u16 msg_length;
-	u8 crc_data = 0;
+	u8 crc_header = 0;
+	u8 crc_msgbytes = 0;
 	int ret = 0;
 	int i;
 
@@ -453,7 +457,19 @@ static int mxt_spi_write_xfer(struct mxt_data *data, u16 reg, u16 len, void *val
 	}
 
 	msg_length = len;
-	crc_data = 0;
+
+	/* Append message to transmit buffer*/
+	memcpy(tx_buf + SPI_HEADER_SIZE, val, len);
+
+	if (data->crc_enabled) {
+		for (i = 0; i < msg_length; i++) {
+			crc_msgbytes = __mxt_calc_crc8(crc_msgbytes, 
+				tx_buf[i + SPI_HEADER_SIZE]);
+		}
+			//Add crc byte to end of message
+			msg_length++;
+			tx_buf[SPI_HEADER_SIZE + len] = crc_msgbytes;
+	}
 	
 	tx_buf[0] = MXT_SPI_WRITE_REQ;
 	tx_buf[1] = reg & 0xff;
@@ -461,15 +477,13 @@ static int mxt_spi_write_xfer(struct mxt_data *data, u16 reg, u16 len, void *val
 	tx_buf[3] = msg_length & 0xff;
 	tx_buf[4] = ((msg_length >> 8) & 0xff);
 
+	/* Calculate the msg header crc8 */
+
 	for (i = 0; i < (SPI_HEADER_SIZE-1); i++) {
-		crc_data = __mxt_calc_crc8(crc_data, tx_buf[i]);
+		crc_header = __mxt_calc_crc8(crc_header, tx_buf[i]);
 	}
 		
-	tx_buf[5] = crc_data;
-
-	/* Append message to transmit buffer*/
-
-	memcpy(tx_buf + SPI_HEADER_SIZE, val, msg_length);
+	tx_buf[5] = crc_header;
 
 	spi_message_init(&tr->msg);
 	tr->msg.spi = spi;
@@ -496,7 +510,7 @@ static int mxt_spi_write_xfer(struct mxt_data *data, u16 reg, u16 len, void *val
 		dev_err(&spi->dev, "SPI transactions failed\n");
 
 	if (rx_buf[0] != MXT_SPI_WRITE_OK) {
-		dev_err(&spi->dev, "spi_write_transfer: SPI write error\n");
+		dev_err(&spi->dev, "spi_write_transfer: SPI write error [%x]\n", rx_buf[0]);
 	}
 	
 	kfree(tr);
@@ -564,7 +578,8 @@ static int mxt_spi_write_req(struct mxt_data *data, u16 reg, u16 len, const void
 	struct request *tr;
 	u8 tx_buf[SPI_MAX_SIZE_LIMIT];
 	u16 msg_length;
-	u8 crc_data = 0;
+	u8 crc_header = 0;
+	u8 crc_msgbytes = 0;
 	int ret = 0;
 	int i;
 
@@ -575,8 +590,20 @@ static int mxt_spi_write_req(struct mxt_data *data, u16 reg, u16 len, const void
 		return -ENOMEM;
 	}
 
+	/* Make copy */
 	msg_length = len;
-	crc_data = 0;
+
+	memcpy(tx_buf + SPI_HEADER_SIZE, val, len);
+
+	if (data->crc_enabled) {
+		for (i = 0; i < msg_length; i++) {
+			crc_msgbytes = __mxt_calc_crc8(crc_msgbytes, 
+				tx_buf[i + SPI_HEADER_SIZE]);
+		}
+			//Add crc byte to end of message
+			msg_length++;
+			tx_buf[SPI_HEADER_SIZE + len] = crc_msgbytes;
+	}
 	
 	tx_buf[0] = MXT_SPI_WRITE_REQ;
 	tx_buf[1] = reg & 0xff;
@@ -585,14 +612,10 @@ static int mxt_spi_write_req(struct mxt_data *data, u16 reg, u16 len, const void
 	tx_buf[4] = ((msg_length >> 8) & 0xff);
 
 	for (i = 0; i < (SPI_HEADER_SIZE-1); i++) {
-		crc_data = __mxt_calc_crc8(crc_data, tx_buf[i]);
+		crc_header = __mxt_calc_crc8(crc_header, tx_buf[i]);
 	}
-		
-	tx_buf[5] = crc_data;
 
-	/* Append message to transmit buffer*/
-
-	memcpy(tx_buf + SPI_HEADER_SIZE, val, msg_length);
+	tx_buf[5] = crc_header;
 
 	spi_message_init(&tr->msg);
 	tr->msg.spi = spi;
@@ -600,7 +623,7 @@ static int mxt_spi_write_req(struct mxt_data *data, u16 reg, u16 len, const void
 	tr->xfer[0].tx_buf = tx_buf;
 	tr->xfer[0].rx_buf = data->spi_rd_buf;
 	tr->xfer[0].len = (SPI_HEADER_SIZE + msg_length) ;
-	tr->xfer[0].delay_usecs = 50;
+	tr->xfer[0].delay_usecs = 500;
 
 	spi_message_add_tail(&tr->xfer[0], &tr->msg);
 
@@ -629,23 +652,28 @@ static int mxt_write_block (struct mxt_data *data, u16 reg, u16 len, const void 
 	void *databuf;
 	u16 msg_length = 0;
 	u16 data_ptr = 0;
+	u8 block_size = MXT_MAX_SPI_BLOCK;
 	int ret = 0;
 
 	databuf = kzalloc(len, GFP_KERNEL);
 	if (!databuf)
 		return -ENOMEM;
 
+	if (data->crc_enabled)
+		block_size = MXT_MAX_SPI_BLOCK_CRC;
+
 	totalBytesToWrite = len;
 
 	do {
-		reinit_completion(&data->write_completion);
 
- 		if (totalBytesToWrite > MXT_MAX_SPI_BLOCK)
- 			msg_length = MXT_MAX_SPI_BLOCK;
+		reinit_completion(&data->write_completion); 
+
+ 		if (totalBytesToWrite > block_size)
+ 			msg_length = block_size;
  		else 
  			msg_length = totalBytesToWrite;
 
-		ret = mxt_spi_write_req(data, (reg + data_ptr), msg_length, val);
+		ret = mxt_spi_write_req(data, (reg + data_ptr), msg_length, (val + data_ptr));
  
 		mxt_wait_for_completion(data, &data->write_completion,
 					      MXT_CS_MAX_DELAY);
@@ -708,6 +736,8 @@ static int mxt_spi_read_req(struct mxt_data *data, u16 reg, u16 len)
 	tr->xfer[0].len = (SPI_HEADER_SIZE);
 	//request->xfer[0].delay_usecs = 500;
 	tr->xfer[0].cs_change = 1;
+	tr->xfer[0].cs_change_delay.unit = 0;
+	tr->xfer[0].cs_change_delay.value = 500;
 
 	spi_message_add_tail(&tr->xfer[0], &tr->msg);
 
@@ -722,13 +752,13 @@ static int mxt_spi_read_req(struct mxt_data *data, u16 reg, u16 len)
 
 }
 
-/*  mxt_spi_read_xfer - Read full SPI message
+/*  mxt_spi_transfer - Read full SPI message
  *
  *  Read one or multiple bytes of data.
  *  Ignores IRQ on response.
  *  Send request and response message within
  *  same transfer
- *  
+ * 
 */
 
 static int mxt_spi_transfer(struct mxt_data *data, u16 reg, u16 len, void *val)
@@ -1126,7 +1156,7 @@ static void mxt_proc_t6_messages(struct mxt_data *data, u8 *msg)
 		dev_dbg(&spi->dev, "T6 Config Checksum: 0x%06X\n", crc);
 	}
 
-	complete(&data->crc_completion);
+	complete(&data->t6_cmd_completion);
 
 	/* Output debug if status has changed */
 	dev_dbg(&spi->dev, "T6 Status 0x%02X%s%s%s%s%s%s%s\n",
@@ -1364,16 +1394,12 @@ static int mxt_process_msg_req(struct mxt_data *data)
 static irqreturn_t mxt_spi_interrupt(int irq, void *dev_id)
 {
 	struct mxt_data *data = dev_id;
-	int error; 
+	int error;
 
 	if (data->in_bootloader) {
 		complete(&data->bl_completion);
 		return IRQ_HANDLED;
 	}
-
-	complete(&data->t6_cmd_completion);
-	complete(&data->read_completion);
-	complete(&data->write_completion);
 
 	/* Required for SPI controller */
 	if (data->system_power_up == false){
@@ -1385,6 +1411,19 @@ static irqreturn_t mxt_spi_interrupt(int irq, void *dev_id)
 	if (!data->object_table)
 		return IRQ_HANDLED;
 
+	switch (data->irq_state) {
+		case MXT_IRQ_READ_REQ:
+			complete(&data->read_completion);
+		break;
+
+		case MXT_IRQ_WRITE_REQ:
+			complete(&data->write_completion);
+		break;
+
+		default:
+		break;
+	}
+
 	if (data->irq_processing) {
 	switch (data->irq_state)
 	{
@@ -1395,10 +1434,6 @@ static irqreturn_t mxt_spi_interrupt(int irq, void *dev_id)
 
 		case MXT_IRQ_PROCESS_READ:
 			error = mxt_process_msg_req(data);
-		break;
-
-		case MXT_IRQ_READ_REQ:
-		case MXT_IRQ_WRITE_REQ:
 		break;
 
 		default:
@@ -1524,7 +1559,11 @@ static int mxt_parse_object_table(struct mxt_data *data,
 		case MXT_GEN_MESSAGE_T5:
 
 				/* CRC not enabled, so skip last byte */
-			data->T5_msg_size = mxt_obj_size(object) - 1;
+			if (data->crc_enabled)
+				data->T5_msg_size = mxt_obj_size(object);
+			else
+				data->T5_msg_size = mxt_obj_size(object) - 1;
+
 			data->T5_address = object->start_address;
 			break;
 		case MXT_GEN_COMMAND_T6:
@@ -1567,6 +1606,10 @@ static int mxt_parse_object_table(struct mxt_data *data,
 			/* first two report IDs reserved */
 			data->num_touchids = object->num_report_ids - 2;
 			break;
+		case MXT_SPT_MESSAGECOUNT_T144:
+			data->T144_address = object->start_address;
+			data->crc_enabled = true;
+			dev_info(dev, "CRC_enabled\n");
 		}
 
 		end_address = object->start_address
@@ -2047,7 +2090,7 @@ static int mxt_acquire_irq(struct mxt_data *data)
 
 	data->irq_state = MXT_IRQ_READ_DONE;
 
-	dev_info(&spi->dev, "Eabling interrupt\n");
+	dev_info(&spi->dev, "Enabling interrupt\n");
 
 	enable_irq(spi->irq);
 
@@ -2341,6 +2384,8 @@ static int mxt_bootloader_read(struct mxt_data *data,
 	return ret;
 }
 
+/* Determine if we are in bootloader mode or not */
+
 static int mxt_probe_bootloader(struct mxt_data *data)
 {
 	struct device *dev = &data->spi->dev;
@@ -2349,13 +2394,13 @@ static int mxt_probe_bootloader(struct mxt_data *data)
 	u8 val;
 	
 	error = mxt_bootloader_read(data, &val, 1);
-	if (error)
+	if (error < 0)
 		return error;
 
 	/* Check app crc fail mode */
 	crc_failure = (val & ~MXT_BOOT_STATUS_MASK) == MXT_APP_CRC_FAIL;
 
-	dev_err(dev, "Detected bootloader, status:%02X%s\n",
+	dev_info(dev, "Bootloader, status:%02X%s\n",
 			val, crc_failure ? ", APP_CRC_FAIL" : "");
 
 	return 0;
@@ -2438,6 +2483,8 @@ static int mxt_initialize(struct mxt_data *data)
 		error = mxt_read_info_block(data);
 		if (!error)
 			break;
+		else if (error == -EIO)
+			return error;
 
 		error = mxt_probe_bootloader(data);
 		if (error) {
@@ -2459,13 +2506,6 @@ static int mxt_initialize(struct mxt_data *data)
 			msleep(MXT_FW_RESET_TIME);
 	}	
 
-	error = mxt_init_t7_power_cfg(data);
-
-	if (error) {
-		dev_err(&spi->dev, "Failed to initialize power cfg\n");
-		return error;
-	}
-	
 	if (data->multitouch) {
 		dev_info(&spi->dev, "mxt_init: Registering devices");
 		error = mxt_initialize_input_devices(data);
@@ -2676,6 +2716,7 @@ static int mxt_clear_cfg(struct mxt_data *data)
 	struct device *dev = &data->spi->dev;
 	struct mxt_cfg config;
 	int totalBytesToWrite = 0;
+	u8 block_size = MXT_MAX_SPI_BLOCK;
 	int write_offset = 0;
 	int msg_size = 0;
 	int error;
@@ -2701,11 +2742,14 @@ static int mxt_clear_cfg(struct mxt_data *data)
 
 	data->irq_state = MXT_IRQ_WRITE_REQ;
 
+	if (data->crc_enabled)
+		block_size = MXT_MAX_SPI_BLOCK_CRC;
+
 	do {
 		reinit_completion(&data->write_completion);
 
-		if (totalBytesToWrite > MXT_MAX_SPI_BLOCK)
-			msg_size = MXT_MAX_SPI_BLOCK;
+		if (totalBytesToWrite > block_size)
+			msg_size = block_size;
 		else
 			msg_size = totalBytesToWrite;
 
@@ -2713,6 +2757,8 @@ static int mxt_clear_cfg(struct mxt_data *data)
 			msg_size, (config.mem + write_offset));
 
 		mxt_wait_for_completion(data, &data->write_completion, MXT_CS_MAX_DELAY);
+
+		data->irq_state = MXT_IRQ_WRITE_DONE;
 
 		error = mxt_spi_write_process(data);
 
@@ -3056,6 +3102,38 @@ static ssize_t mxt_update_fw_store(struct device *dev,
 	return count;
 }
 
+static ssize_t mxt_reset_show(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	struct mxt_data *data = dev_get_drvdata(dev);
+	char c;
+
+	c = data->mxt_reset_state? '1' : '0';
+	return scnprintf(buf, PAGE_SIZE, "%c\n", c);
+}
+
+static ssize_t mxt_reset_store(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct mxt_data *data = dev_get_drvdata(dev);
+	u8 i;
+	ssize_t ret = 0;
+
+	if (kstrtou8(buf, 0, &i) == 0) {
+	
+		data->mxt_reset_state = true;
+
+		ret = mxt_soft_reset(data, true);
+
+		data->mxt_reset_state = false;
+		
+	} else {
+		data->mxt_reset_state = false;
+	}
+
+	return count;
+}
+
 static ssize_t mxt_update_cfg_store(struct device *dev,
 		struct device_attribute *attr,
 		const char *buf, size_t count)
@@ -3183,7 +3261,7 @@ static ssize_t mxt_hw_version_show(struct device *dev,
 }
 
 /* Firmware Version is returned as Major.Minor.Build */
-ssize_t mxt_fw_version_show(struct device *dev,
+static ssize_t mxt_fw_version_show(struct device *dev,
 				   struct device_attribute *attr, char *buf)
 {
 	struct mxt_data *data = dev_get_drvdata(dev);
@@ -3503,6 +3581,8 @@ static DEVICE_ATTR(debug_irq, S_IWUSR | S_IRUSR, mxt_debug_irq_show,
 static DEVICE_ATTR(in_bootloader, S_IWUSR | S_IRUSR, mxt_bootloader_show,
 		   mxt_bootloader_store);
 
+static DEVICE_ATTR(mxt_reset, S_IWUSR | S_IRUSR, mxt_reset_show, mxt_reset_store);
+
 static struct attribute *mxt_attrs[] = {
 	&dev_attr_fw_version.attr,
 	&dev_attr_hw_version.attr,
@@ -3515,6 +3595,7 @@ static struct attribute *mxt_attrs[] = {
 	&dev_attr_debug_enable.attr,
 	&dev_attr_debug_v2_enable.attr,
 	&dev_attr_debug_notify.attr,
+	&dev_attr_mxt_reset.attr,
 	NULL
 };
 
@@ -3577,9 +3658,6 @@ static int mxt_spi_probe(struct spi_device *spi)
 	spi_set_drvdata(spi, data);
 
 	init_completion(&data->bl_completion);
-	//init_completion(&data->reset_completion);
-
-	init_completion(&data->crc_completion);
 	init_completion(&data->read_completion);
 	init_completion(&data->write_completion);
 	init_completion(&data->t6_cmd_completion);
@@ -3594,39 +3672,38 @@ static int mxt_spi_probe(struct spi_device *spi)
 	data->reset_gpio = devm_gpiod_get_optional(&spi->dev,
 						   "reset", GPIOD_OUT_HIGH);
 
-	if (IS_ERR(data->reset_gpio)) {
-		error = PTR_ERR(data->reset_gpio);
-		dev_err(&spi->dev, "Failed to get reset gpio: %d\n", error);
-		return error;
+	if (IS_ERR_OR_NULL(data->reset_gpio)) {
+
+		if (data->reset_gpio == NULL)
+			dev_warn(&spi->dev, "Warning: reset-gpios not found or undefined\n");
+		else {
+			error = PTR_ERR(data->reset_gpio);
+		 	dev_err(&spi->dev, "Failed to get reset-gpios: %d\n", error);
+		 	return error;
+		 }
 	} else {
 		dev_info(&spi->dev, "Got Reset GPIO\n");
+
+		gpiod_direction_output(data->reset_gpio, 1);	/* GPIO in device tree is active-low */
+		dev_info(&spi->dev, "Direction is ouput\n");	
+	
+		dev_info(&spi->dev, "Resetting chip\n");
+		gpiod_set_value(data->reset_gpio, 1);		/* Assert reset value = 1 */																																																																																																																																																																																																																																																																
+		msleep(MXT_RESET_GPIO_TIME);
+		gpiod_set_value(data->reset_gpio, 0);		/* Deassert reset value = 0 */
+		msleep(MXT_RESET_INVALID_CHG);
 	}
 
 	error = devm_request_threaded_irq(&spi->dev, spi->irq,
-					  NULL, mxt_spi_interrupt, IRQF_ONESHOT,
-					  dev_name(&data->spi->dev), data);
+			NULL, mxt_spi_interrupt, IRQF_ONESHOT,
+			dev_name(&data->spi->dev), data);
+	
 	if (error) {
 		dev_err(&spi->dev, "Failed to register interrupt\n");
 		return error;
 	}
 
 	disable_irq_nosync(data->spi->irq);
-
-	//Duplicate. don't need if using devm_gpiod_get_optional
-	//Consider which one to remove
-
-	if(!(IS_ERR(data->reset_gpio))) {
-		gpiod_direction_output(data->reset_gpio, 1);	/* GPIO in device tree is active-low */
-		dev_info(&spi->dev, "Direction is ouput\n");	/* Deassert reset value = 0 */
-	}
-	
-	if(!(IS_ERR(data->reset_gpio))) {
-		dev_info(&spi->dev, "Resetting chip\n");
-		gpiod_set_value(data->reset_gpio, 1);
-		msleep(MXT_RESET_GPIO_TIME);
-		gpiod_set_value(data->reset_gpio, 0);
-		msleep(MXT_RESET_INVALID_CHG);
-	}
 
 	data->in_bootloader = false;
 
@@ -3655,21 +3732,31 @@ static int mxt_spi_probe(struct spi_device *spi)
 static void mxt_start(struct mxt_data *data)
 {
 	
-	dev_info (&data->spi->dev, "mxt_start:  Starting . . .\n");
+	dev_info(&data->spi->dev, "mxt_start:  Starting . . .\n");
 
-	/* TBD - may be executed with irq disabled */
+	/* May be executed with irq disabled */
 
-	//mxt_set_t7_power_cfg(data, MXT_POWER_CFG_RUN);
+	if ((data->info->family_id == 0xa6) && 
+		(data->info->variant_id == 0x15)) {
 
+		dev_info(&data->spi->dev, "Resume unsupported on this device\n");
+	} else {
+		mxt_set_t7_power_cfg(data, MXT_POWER_CFG_RUN);
+	}
 }
 
 static void mxt_stop(struct mxt_data *data)
 {
 
-	dev_info (&data->spi->dev, "mxt_stop:  Stopping . . .\n");
-	
-	/* TBD - Continue using deep sleep when driver is paused? */	
-	//mxt_set_t7_power_cfg(data, MXT_POWER_CFG_DEEPSLEEP);
+	dev_info(&data->spi->dev, "mxt_stop:  Stopping . . .\n");	
+
+	if ((data->info->family_id == 0xa6) && 
+		(data->info->variant_id == 0x15)) {
+
+		dev_info(&data->spi->dev, "Suspend unsupported on on this device\n");
+	} else {
+		mxt_set_t7_power_cfg(data, MXT_POWER_CFG_DEEPSLEEP);
+	}
 
 }
 
@@ -3770,7 +3857,7 @@ static SIMPLE_DEV_PM_OPS(mxt_pm_ops, mxt_suspend, mxt_resume);
 
 #ifdef CONFIG_OF
 static const struct of_device_id mxt_ts_of_match[] = {
-	{ .compatible = "microchip, mchp_spi_ts"},
+	{ .compatible = "microchip,mchp_spi_ts"},
 	{ },
 };
 MODULE_DEVICE_TABLE(of, mxt_ts_of_match);
