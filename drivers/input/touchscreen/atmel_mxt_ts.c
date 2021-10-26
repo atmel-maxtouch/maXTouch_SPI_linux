@@ -5051,6 +5051,7 @@ static void mxt_sysfs_remove(struct mxt_data *data)
 static void mxt_start(struct mxt_data *data)
 {
 	struct i2c_client *client = data->client;
+	int buff;
 
 	dev_info (&client->dev, "mxt_start:  Starting . . .\n");
 
@@ -5069,11 +5070,13 @@ static void mxt_start(struct mxt_data *data)
 	case MXT_SUSPEND_DEEP_SLEEP:
 	default:
 
-		if ((data->info->family_id == 0xa6) && 
-		(data->info->variant_id == 0x15)) {
+		if (((data->info->family_id == 0xa6) && 
+			(data->info->variant_id == 0x15)) ||
+			((data->info->family_id == 0xa7) && 
+			(data->info->variant_id == 0x00))) {
+			
+			dev_info(&client->dev, "Resume unsupported on this device\n");
 
-			dev_info(&client->dev,
-				"Resume unsupported on this device\n");
 		} else {
 
 			data->irq_processing = false;
@@ -5112,8 +5115,10 @@ static void mxt_stop(struct mxt_data *data)
 
 	default:
 		
-		if ((data->info->family_id == 0xa6) && 
-			(data->info->variant_id == 0x15)) {
+		if (((data->info->family_id == 0xa6) && 
+			(data->info->variant_id == 0x15)) ||
+			((data->info->family_id == 0xa7) && 
+			(data->info->variant_id == 0x00))) {
 
 			dev_info(&client->dev,
 				"Suspend unsupported on this device\n");
