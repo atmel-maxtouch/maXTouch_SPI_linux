@@ -96,6 +96,7 @@
 #define MXT_SPT_TOUCHEVENTTRIGGER_T79		   79
 #define MXT_PROCI_RETRANSMISSIONCOMPENSATION_T80   80
 #define MXT_TOUCH_MULTITOUCHSCREEN_T100 	   100
+#define MXT_DATACONTAINER_T117			   117
 #define MXT_SPT_MESSAGECOUNT_T144		   144
 
 /* MXT_GEN_MESSAGE_T5 object */
@@ -113,7 +114,7 @@
 #define MXT_FW_RESET_TIME	3000	/* msec */
 #define MXT_FW_CHG_TIMEOUT	300	/* msec */
 #define MXT_BOOTLOADER_WAIT	3000	/* msec */
-#define MXT_CS_MAX_DELAY 	1 	/* msec */
+#define MXT_CS_MAX_DELAY 	1000 	/* msec */
 #define MXT_REPORTALL_MAX_DELAY	50 	/* msec */
 #define MXT_CONFIG_MAX_DELAY 	3 	/* msec */
 #define MXT_BOOTLOADER_READ 	0x01	/* msec */
@@ -231,6 +232,7 @@ struct mxt_cfg {
 	size_t mem_size;
 	int start_ofs;
 	struct mxt_info info;
+	u16 object_skipped_ofs;
 };
 
 enum interrupt_state {
@@ -346,6 +348,24 @@ struct mxt_data {
 	bool mxt_reset_state;
 };
 
+static bool mxt_object_is_volatile(struct mxt_data *data, uint16_t object_type)
+{
+ 
+ 	switch (object_type) {
+  	case MXT_GEN_MESSAGE_T5:
+  	case MXT_GEN_COMMAND_T6:
+  	case MXT_DEBUG_DIAGNOSTIC_T37:
+  	case MXT_SPT_MESSAGECOUNT_T44:
+  	case MXT_DATACONTAINER_T117:
+  	case MXT_SPT_MESSAGECOUNT_T144:
+  
+    	return true;
+
+  	default:
+    	return false;
+    }	
+}
+
 /*
  *  mxt_wait_for_completion - Manage completion operations
  * 
@@ -370,7 +390,7 @@ static int mxt_wait_for_completion(struct mxt_data *data,
 	if (ret < 0) {
 		return ret;
 	} else if (ret == 0) {
-		dev_err(dev, "Wait for completion timed out\n");
+		dev_err(dev, "Wait for completion timed out %d\n", timeout_ms);
 		return -ETIMEDOUT;
 	} else {
 		dev_dbg(dev, "Time left: %u ms\n", jiffies_to_msecs(ret));
@@ -617,6 +637,9 @@ static int mxt_spi_write_req(struct mxt_data *data, u16 reg, u16 len, const void
 
 	tx_buf[5] = crc_header;
 
+	/* Zero-initialize message for future compatiblity */
+	memset(&tr->msg, 0x00, sizeof(tr->msg));
+
 	spi_message_init(&tr->msg);
 	tr->msg.spi = spi;
 
@@ -653,7 +676,7 @@ static int mxt_write_block (struct mxt_data *data, u16 reg, u16 len, const void 
 	u16 msg_length = 0;
 	u16 data_ptr = 0;
 	u8 block_size = MXT_MAX_SPI_BLOCK;
-	int ret = 0;
+	int ret = 0, retry = 0;
 
 	databuf = kzalloc(len, GFP_KERNEL);
 	if (!databuf)
@@ -679,7 +702,20 @@ static int mxt_write_block (struct mxt_data *data, u16 reg, u16 len, const void 
 					      MXT_CS_MAX_DELAY);
 
 		ret = mxt_spi_write_process(data);
+
 		msleep(1);
+
+		if (ret)
+		{
+			if (retry < 4) {
+				retry++;
+				continue;
+			} else {
+				return ret;
+			}
+		}
+
+		retry = 0;
 
 		data_ptr += msg_length;
 		totalBytesToWrite -= msg_length;
@@ -773,7 +809,7 @@ static int mxt_spi_transfer(struct mxt_data *data, u16 reg, u16 len, void *val)
 	u8 crc_data = 0;
 	u8 tx_buf[7];	
 	u8 rx_buf[7];
-	int ret = 0;
+	int ret = 0, retry = 0;
 	int i;
 
 	tr = kzalloc(sizeof *tr, GFP_ATOMIC);
@@ -846,6 +882,18 @@ static int mxt_spi_transfer(struct mxt_data *data, u16 reg, u16 len, void *val)
 		
 		memcpy((val + data_ptr), &data->spi_rd_buf[SPI_HEADER_SIZE], msg_length);
 
+		if (data->spi_rd_buf[0] == 0x04) {
+			if (retry < 4) {
+				retry++;
+				continue;
+			} else {
+				dev_err(&spi->dev, "SPI Read failure\n");
+				return -EIO;
+			}
+		}
+
+		retry = 0;
+
 		data_ptr += msg_length;
 		total_byte_count -= msg_length;
 
@@ -891,6 +939,9 @@ static int mxt_read_data(struct mxt_data *data, u16 reg, u16 len, void *val)
 			msg_length = total_byte_count;
 		}
 
+		/* Zero-initialize message for future compatiblity */
+		memset(&tr->msg, 0x00, sizeof(tr->msg));
+
 		spi_message_init(&tr->msg);
 		tr->msg.spi = spi;
 
@@ -907,6 +958,9 @@ static int mxt_read_data(struct mxt_data *data, u16 reg, u16 len, void *val)
 			dev_err(&spi->dev, "SPI transactions failed\n");
 		
 		memcpy((val + data_ptr), &data->spi_rd_buf[SPI_HEADER_SIZE], msg_length);
+
+		if (data->spi_rd_buf[0] == 0x04)
+			continue;
 
 		data_ptr += msg_length;
 		total_byte_count -= msg_length;
@@ -1894,9 +1948,13 @@ static int mxt_prepare_cfg_mem (struct mxt_data *data, struct mxt_cfg *cfg)
 	struct mxt_object *object;
 	unsigned int type, instance, size, byte_offset = 0;
 	int offset, write_offset = 0;
+	unsigned int first_obj_type = 0;
+	unsigned int first_obj_addr = 0;
 	int ret, i, error;
 	u16 reg;
 	u8 val;
+
+	cfg->object_skipped_ofs = 0;
 
 	while (cfg->raw_pos < cfg->raw_size) {
 		/* Read type, instance, length */
@@ -1912,8 +1970,29 @@ static int mxt_prepare_cfg_mem (struct mxt_data *data, struct mxt_cfg *cfg)
 		cfg->raw_pos += offset;
 
 		object = mxt_get_object(data, type);
-		if (!object) {
-			/* Skip object */
+
+		/* Find first object in cfg file; if not first in device */
+		if (first_obj_type == 0) {
+			first_obj_type = type;
+			first_obj_addr = object->start_address;
+
+			dev_info(dev, "First object found T[%d]\n", type);
+
+			if (first_obj_addr > cfg->start_ofs) {
+				cfg->object_skipped_ofs = first_obj_addr - cfg->start_ofs;
+
+				dev_dbg(dev, "cfg->object_skipped_ofs %d, first_obj_addr %d, cfg->start_ofs %d\n", 
+					cfg->object_skipped_ofs, first_obj_addr, cfg->start_ofs);
+
+				cfg->mem_size = cfg->mem_size - cfg->object_skipped_ofs;
+			}
+		}
+
+		if(!object || (mxt_object_is_volatile(data, type))) {
+			/* Skip object if not present in device or volatile */
+		
+		dev_info(dev, "Skipping object T[%d] Instance %d\n", type, instance);
+
 			for (i = 0; i < size; i++) {
 				ret = sscanf(cfg->raw + cfg->raw_pos, "%hhx%n",
 					     &val, &offset);
@@ -1923,7 +2002,16 @@ static int mxt_prepare_cfg_mem (struct mxt_data *data, struct mxt_cfg *cfg)
 					return -EINVAL;
 				}
 				cfg->raw_pos += offset;
+
+				/* Adjust byte_offset for skipped objects */
+				cfg->object_skipped_ofs = cfg->object_skipped_ofs + 1;
+
+				/* Adjust config memory size, less to program */
+				/* Only for non-volatile T objects */
+				cfg->mem_size--;
+				dev_dbg(dev, "cfg->mem_size [%d]\n", cfg->mem_size);
 			}
+
 			continue;
 		}
 
@@ -1970,13 +2058,13 @@ static int mxt_prepare_cfg_mem (struct mxt_data *data, struct mxt_cfg *cfg)
 			if (i > mxt_obj_size(object))
 				continue;
 
-			byte_offset = reg + i - cfg->start_ofs;
+			byte_offset = reg + i - cfg->start_ofs - cfg->object_skipped_ofs;
 
 			/* Data starts only at selected object address */
-			if (reg >= cfg->start_ofs) {
+			if (byte_offset >= 0) {
 				*(cfg->mem + byte_offset) = val;
 			} else {
-				dev_dbg(dev, "Skipping object: reg:%d, T%d, ofs=%d\n",
+				dev_err(dev, "Bad object: reg: %d, T%d, ofs=%d\n",
 					reg, object->type, byte_offset);
 			}
 		}
@@ -1985,6 +2073,8 @@ static int mxt_prepare_cfg_mem (struct mxt_data *data, struct mxt_cfg *cfg)
 
 			data->irq_state = MXT_IRQ_WRITE_REQ;
 			error = mxt_write_block (data, reg, size, (cfg->mem + write_offset));
+			if (error)
+					dev_err(dev, "Config write error\n");
 			write_offset = write_offset + size;
 		}
 	}
@@ -1995,8 +2085,8 @@ static int mxt_prepare_cfg_mem (struct mxt_data *data, struct mxt_cfg *cfg)
 /*  mxt_t6_command
  *  
  *  Sends T6 command to device
- *   If wait is true, command byte is checked until cleared 
- *  
+ *  If wait is true, command byte is checked until cleared 
+ *  then look for T6 completion, manually
 */
 
 static int mxt_t6_command(struct mxt_data *data, u16 cmd_offset,
@@ -2005,8 +2095,9 @@ static int mxt_t6_command(struct mxt_data *data, u16 cmd_offset,
 	
 	struct spi_device *spi = data->spi;
 	u8 command_register;
+	int retry = 0;
+	int ret = 0;
 	u16 reg;
-	int ret;
 
 	reinit_completion(&data->write_completion);
 
@@ -2028,33 +2119,35 @@ static int mxt_t6_command(struct mxt_data *data, u16 cmd_offset,
 		return 0;
 	}
 
-	reinit_completion(&data->t6_cmd_completion);
+	do {
+		ret = mxt_spi_read_req(data, reg, 1);
 
-	/* Took min of 30ms for /CHG line to drop */
-	/* Processing report_all command */
-	mxt_wait_for_completion(data, &data->t6_cmd_completion, 
-		MXT_REPORTALL_MAX_DELAY);
+		msleep(1);
 
-	reinit_completion(&data->read_completion);
-
-	ret = mxt_spi_read_req(data, reg, 1);
-
-	mxt_wait_for_completion(data, &data->read_completion,
-					      MXT_CS_MAX_DELAY);
-
-	ret = mxt_read_data(data, reg, 1, &command_register);
+		ret = mxt_read_data(data, reg, 1, &command_register);
 
 	if (ret)
 		return ret;
 
-	if (command_register != 0x00)
-		dev_warn(&data->spi->dev, "T6 Command failed\n");
-	else
-		dev_info(&spi->dev, "T6 Command Succeeded\n");
+		retry++;
+
+		if (retry == 3) {
+			dev_warn(&data->spi->dev, "T6 Command failed\n");
+			break;
+		}	
+
+	} while (command_register != 0x00);
+
+	dev_info(&spi->dev, "T6 Command Succeeded\n");
+
+	/* Took min of 30ms for /CHG line to drop */
+	/* Processing report all, waiting for T6 report*/
+
+	msleep(30);
 
 	ret = mxt_process_messages_until_invalid(data);
 
-	data->irq_state = MXT_IRQ_READ_DONE;
+	data->irq_state = MXT_IRQ_WRITE_DONE;
 
 	return 0;
 }
@@ -2535,6 +2628,89 @@ static void mxt_update_crc(struct mxt_data *data, u8 cmd, u8 value)
 	mxt_t6_command(data, cmd, value, wait);	
 }
 
+static int mxt_clear_cfg(struct mxt_data *data, struct mxt_cfg *cfg)
+{
+	struct device *dev = &data->spi->dev;
+	u16 config_size = 0;
+	int totalBytesToWrite = 0;
+	u8 block_size = MXT_MAX_SPI_BLOCK;
+	int write_offset = 0;
+	int msg_size = 0;
+	int error = 0, retry = 0;
+	int *cbuff;
+
+	config_size = data->mem_size - cfg->start_ofs;
+
+	totalBytesToWrite = config_size;
+	
+	cbuff = kzalloc(config_size, GFP_KERNEL);
+	if (!cbuff) {
+		error = -ENOMEM;
+		goto release_cbuff;
+	}
+
+	dev_dbg(dev, "clear_cfg: config_size %i, config->start_ofs %i\n", 
+		config_size, cfg->start_ofs);
+
+	data->irq_state = MXT_IRQ_WRITE_REQ;
+
+	if (data->crc_enabled)
+		block_size = MXT_MAX_SPI_BLOCK_CRC;
+
+	do {
+		reinit_completion(&data->write_completion);
+
+		if (totalBytesToWrite > block_size)
+			msg_size = block_size;
+		else
+			msg_size = totalBytesToWrite;
+
+		error = mxt_spi_write_req(data, (cfg->start_ofs + write_offset),
+			msg_size, (cbuff + write_offset));
+
+		mxt_wait_for_completion(data, &data->write_completion, MXT_CS_MAX_DELAY);
+
+		error = mxt_spi_write_process(data);
+
+		//Delay required to allow data to be processed
+		//before next write, else bad response
+
+		msleep(1);
+
+		if (error) {
+			if (retry < 4) {
+				retry++;
+				continue;
+			} else {
+				dev_info(dev, "Error clearning configuration\n");
+				goto release_cbuff;
+			}
+		}
+
+		retry = 0;
+
+		write_offset += msg_size;
+
+		totalBytesToWrite -= msg_size;
+		
+	} while (totalBytesToWrite > 0);
+
+	data->irq_state = MXT_IRQ_WRITE_DONE;
+
+	msleep(10);
+
+	mxt_update_crc(data, MXT_COMMAND_BACKUPNV, MXT_BACKUP_VALUE);
+
+	/* Possible change to completion command */
+	msleep(100);
+
+	dev_info(dev, "Config successfully cleared\n");
+
+release_cbuff:
+	kfree(cbuff);
+	return error;
+}
+
 /*
  * mxt_update_cfg - download configuration to chip
  *
@@ -2660,7 +2836,10 @@ static int mxt_update_cfg(struct mxt_data *data, const struct firmware *fw)
 
 	msleep(5);
 
-	cfg.start_ofs = data->T38_address;
+	/* Malloc memory to store configuration */
+	cfg.start_ofs = MXT_OBJECT_START +
+			data->info->object_num * sizeof(struct mxt_object) +
+			MXT_INFO_CHECKSUM_SIZE;
 
 	cfg.mem_size = data->mem_size - cfg.start_ofs;
 
@@ -2670,17 +2849,28 @@ static int mxt_update_cfg(struct mxt_data *data, const struct firmware *fw)
 		goto release_mem;
 	}
 
+	dev_dbg(dev, "update_cfg: cfg.mem_size %i, cfg.start_ofs %i, cfg.raw_pos %lld, offset %i", 
+	cfg.mem_size, cfg.start_ofs, (long long)cfg.raw_pos, offset);
+
+	ret = mxt_clear_cfg(data, &cfg);
+
 	/* Prepares and programs configuration */
 	ret = mxt_prepare_cfg_mem(data, &cfg);
 	if (ret)
 		goto release_mem;
 
-	/* Calculate CRC of config held in cfg.mem buffer */
+		/* Calculate crc of the config file */
+	/* Config file must include all objects used in CRC calculation */
 
-	crc_start = data->T38_address;
-
-	dev_dbg(dev, "cfg.mem_size %i, cfg.start_ofs %i, cfg.raw_pos %lld, offset %i", 
-	cfg.mem_size, cfg.start_ofs, (long long)cfg.raw_pos, offset);
+	if (data->T14_address)
+		crc_start = data->T14_address;
+	else if (data->T71_address)
+		crc_start = data->T71_address;
+	else if (data->T7_address)
+		crc_start = data->T7_address;
+	/* Set position to next line */
+	else
+		dev_warn(dev, "Could not find CRC start\n");
 
 	if (crc_start > cfg.start_ofs) {
 		calculated_crc = mxt_calculate_crc(cfg.mem, 0, cfg.mem_size);
@@ -2696,102 +2886,39 @@ static int mxt_update_cfg(struct mxt_data *data, const struct firmware *fw)
 
 	msleep(50);	//Allow 50ms before issuing reset
 
-	mxt_soft_reset(data, true);
+	if (((data->info->family_id == 0xa6) && 
+		(data->info->variant_id == 0x15)) ||
+		((data->info->family_id == 0xa7) && 
+		(data->info->variant_id == 0x00))) {
+
+			dev_info(dev,
+				"Software reset unsupported on this device\n");
+		
+		/* Recalibrate since chip has been in deep sleep */
+			mxt_t6_command(data, MXT_COMMAND_CALIBRATE, 1, false);
+
+	} else {
+		mxt_soft_reset(data, true);
+	}
 
 	dev_info(dev, "Config successfully updated\n");
 
 	/* T7 config may have changed */
 	mxt_init_t7_power_cfg(data);
 
+	//Clear messages after update in cases /CHG low
+	error = mxt_process_messages_until_invalid(data);
+	if (error)
+		dev_dbg(dev, "Unable to clear CHG line\n");
+
 release_mem:
 	kfree(cfg.mem);
 release_raw:
 	kfree(cfg.raw);
 
-	return ret;
-}
-
-static int mxt_clear_cfg(struct mxt_data *data)
-{
-	struct device *dev = &data->spi->dev;
-	struct mxt_cfg config;
-	int totalBytesToWrite = 0;
-	u8 block_size = MXT_MAX_SPI_BLOCK;
-	int write_offset = 0;
-	int msg_size = 0;
-	int error;
-	
-	//Start at beginning of config space
-
-	config.start_ofs = MXT_OBJECT_START +
-			data->info->object_num * sizeof(struct mxt_object) +
-			MXT_INFO_CHECKSUM_SIZE;		
-
-	config.mem_size = data->mem_size - config.start_ofs;
-
-	config.mem = kzalloc(config.mem_size, GFP_KERNEL);
-	if (!config.mem) {
-		error = -ENOMEM;
-		goto release_mem;
-	}
-
-	dev_dbg(dev, "clear_cfg: config.mem_size %i, config.start_ofs %i\n", 
-		config.mem_size, config.start_ofs);
-
-	totalBytesToWrite = config.mem_size;
-
-	data->irq_state = MXT_IRQ_WRITE_REQ;
-
-	if (data->crc_enabled)
-		block_size = MXT_MAX_SPI_BLOCK_CRC;
-
-	do {
-		reinit_completion(&data->write_completion);
-
-		if (totalBytesToWrite > block_size)
-			msg_size = block_size;
-		else
-			msg_size = totalBytesToWrite;
-
-		error = mxt_spi_write_req(data, (config.start_ofs + write_offset),
-			msg_size, (config.mem + write_offset));
-
-		mxt_wait_for_completion(data, &data->write_completion, MXT_CS_MAX_DELAY);
-
-		data->irq_state = MXT_IRQ_WRITE_DONE;
-
-		error = mxt_spi_write_process(data);
-
-		//Delay required to allow data to be processed
-		//before next write, else bad response
-
-		msleep(1);
-
-		if (error) {
-			dev_info(dev, "Error writing configuration\n");
-			goto release_mem;
-		}
-
-		write_offset += msg_size;
-
-		totalBytesToWrite -= msg_size;
-		
-	} while (totalBytesToWrite > 0);
-
 	data->irq_state = MXT_IRQ_WRITE_DONE;
 
-	msleep(10);
-
-	mxt_update_crc(data, MXT_COMMAND_BACKUPNV, MXT_BACKUP_VALUE);
-
-	/* Possible change to completion command */
-	msleep(100);
-
-	dev_info(dev, "Config successfully cleared\n");
-
-release_mem:
-	kfree(config.mem);
-	return error;
+	return ret;
 }
 
 static int mxt_configure_objects(struct mxt_data *data,
@@ -3062,11 +3189,6 @@ static ssize_t mxt_update_fw_store(struct device *dev,
 
 	data->irq_state = MXT_IRQ_WRITE_REQ;
 
- 	//error = mxt_clear_cfg(data);
-
-	//if (error)
-	//	dev_err(dev, "Failed clear configuration\n");
-
 	error = mxt_load_fw(dev, MXT_FW_NAME);
 	if (error) {
 		dev_err(dev, "The firmware update failed(%d)\n. IRQ disabled.", error);
@@ -3144,13 +3266,6 @@ static ssize_t mxt_update_cfg_store(struct device *dev,
 	int error;
 
 	data->sysfs_updating_config_fw = true;
-
-	error = mxt_clear_cfg(data);
-
-	if (error)
-		dev_err(dev, "Failed clear configuration\n");
-	else
-		dev_info(dev, "Done with clear configuration\n");
 
 	ret = request_firmware(&cfg, MXT_CFG_NAME, dev);
 	if (ret < 0) {

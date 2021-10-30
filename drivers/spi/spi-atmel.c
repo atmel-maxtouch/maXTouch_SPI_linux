@@ -1223,6 +1223,8 @@ static int atmel_spi_setup(struct spi_device *spi)
 		csr |= SPI_BIT(CPOL);
 	if (!(spi->mode & SPI_CPHA))
 		csr |= SPI_BIT(NCPHA);
+	else
+		csr | SPI_BF(NCPHA, 0);
 
 	if (!spi->cs_gpiod)
 		csr |= SPI_BIT(CSAAT);
